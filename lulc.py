@@ -1,141 +1,90 @@
-#!pip install streamlit
-#!pip install langchain_google_genai
-import os
 import streamlit as st
-import ee
-import geemap.foliumap as geemap
-#from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.schema import StrOutputParser, HumanMessage
-from langchain_core.prompts import PromptTemplate
-from langchain_core.caches import InMemoryCache
-from langchain_core.globals import set_llm_cache
-import ast
-class VisualizationAssistant:
-    # class‐level constants
-    CLASS_NAMES = [
-        'water', 'trees', 'grass', 'flooded_vegetation',
-        'crops', 'shrub_and_scrub', 'built', 'bare', 'snow_and_ice'
-    ]
-    VIS_PALETTE = [
-        '419bdf', '397d49', '88b053', '7a87c6', 'e49635',
-        'dfc35a', 'c4281b', 'a59b8f', 'b39fe1'
-    ]
-    
-    def __init__(self, model: ChatOpenAI):
-        self.model = model
+import pandas as pd
+import numpy as np
 
-    def extract_data(self, question: str) -> dict:
-        prompt = f"""
-        You are a data extraction agent specialized in geospatial and temporal analysis.
+st.title('森林地上碳储量估算器')
 
-        Given a user's query about a location and time period, extract:
+st.write("""
+这个应用可以帮助你估算森林的地上碳储量。请输入以下参数进行计算。
+""")
 
-        - The exact geographic point as [longitude, latitude] in decimal degrees.
-        - The START and END dates as strings in 'YYYY-MM-DD' format.
+# 创建输入区域
+with st.container():
+    st.subheader("基本参数输入")
 
-        Rules:
-        - If the user specifies only a year, set START = 'YYYY-01-01' and END = 'YYYY-12-31'.
-        - If the user specifies vague dates like seasons or months, pick reasonable date ranges (e.g. August to September).
-        - If the user specifies a place name (city, country, region), return the coordinates of its central or capital location.
+    col1, col2 = st.columns(2)
 
-        Output **only** a single JSON dictionary like this (no extra text):
+    with col1:
+        dbh = st.number_input('胸径(DBH,cm)', 
+                             min_value=1.0, 
+                             max_value=300.0, 
+                             value=20.0)
 
-        {{"point": [longitude, latitude], "START": "YYYY-MM-DD", "END": "YYYY-MM-DD"}}
+        height = st.number_input('树高(H,m)', 
+                               min_value=1.0,
+                               max_value=100.0, 
+                               value=15.0)
 
-        User query: "{question}"
-        """
-        messages = [HumanMessage(content=prompt)]
-        return self.model.invoke(messages).content.strip()
+    with col2:
+        wood_density = st.number_input('木材密度(g/cm³)', 
+                                     min_value=0.1,
+                                     max_value=1.5,
+                                     value=0.5)
 
-    def create_dw_rgb_hillshade(self, image: ee.Image) -> ee.Image:
-        label_rgb = image.select('label') \
-                         .visualize(min=0, max=8, palette=self.VIS_PALETTE) \
-                         .divide(255)
-        prob_max = image.select(self.CLASS_NAMES).reduce(ee.Reducer.max())
-        hillshade = ee.Terrain.hillshade(prob_max.multiply(100)).divide(255)
-        return label_rgb.multiply(hillshade) \
-                        .set('system:time_start', image.get('system:time_start'))
+        trees_per_ha = st.number_input('每公顷株数',
+                                     min_value=1,
+                                     max_value=10000,
+                                     value=100)
 
-    def add_visual_layers(self, dw_vis: ee.Image, s2_img: ee.Image, m: geemap.Map):
-        date = ee.Date(dw_vis.get('system:time_start')).format('YYYY-MM-dd').getInfo()
-        m.addLayer(s2_img, {'min': 0, 'max': 3000, 'bands': ['B4','B3','B2']},
-                   f"RGB {date}")
-        m.addLayer(dw_vis, {'min': 0, 'max': 0.65}, f"DW {date}")
+# 计算函数
+def calculate_biomass(dbh, height, wood_density):
+    """使用改良的相对生长方程计算单株生物量"""
+    # 这里使用一个简化的方程,实际应用中可以根据树种和地区选择合适的方程
+    biomass = 0.0673 * (wood_density * dbh**2 * height)**0.976
+    return biomass
 
-    def show(self, point_coords: list, START: str, END: str):
-        point = ee.Geometry.Point(point_coords)
-        filt = ee.Filter.And(ee.Filter.bounds(point), ee.Filter.date(START, END))
-        dw_col = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').filter(filt)
-        s2_col = ee.ImageCollection('COPERNICUS/S2_HARMONIZED').filter(filt)
-        s2_names = s2_col.first().bandNames()
-        linked = dw_col.linkCollection(s2_col, s2_names)
-        dw_vis_col = linked.map(lambda img: self.create_dw_rgb_hillshade(img))
+def calculate_carbon(biomass):
+    """将生物量转换为碳储量(使用转换系数0.5)"""
+    return biomass * 0.5
 
-        # build map
-        m = geemap.Map(center=[point_coords[1], point_coords[0]], zoom=12)
-        size = linked.size().getInfo()
-        for i in range(size):
-            img = ee.Image(linked.toList(size).get(i))
-            dw_vis = self.create_dw_rgb_hillshade(img)
-            self.add_visual_layers(dw_vis, img, m)
+if st.button('计算碳储量'):
+    # 计算单株生物量
+    biomass_per_tree = calculate_biomass(dbh, height, wood_density)
 
-        # legend
-        legend = {name: f"#{col}" for name, col in zip(self.CLASS_NAMES, self.VIS_PALETTE)}
-        m.add_legend(title="Dynamic World Classes", legend_dict=legend)
-        st.title("🌍 Dynamic World overlaid on Sentinel-2")
-        m.to_streamlit(height=600)
+    # 计算每公顷生物量
+    biomass_per_ha = biomass_per_tree * trees_per_ha
 
-def initialize_session_state():
-    if "messages" not in st.session_state:
-        st.session_state.messages = [
-            {"role": "assistant",
-             "content": "👋 Hi! Enter the area and duration you want to plot"}
-        ]
+    # 计算碳储量
+    carbon_per_ha = calculate_carbon(biomass_per_ha)
 
-def main():
-    st.set_page_config(page_title="Dynamic World Visualizer", layout="wide")
-    initialize_session_state()
-    ee.Authenticate()
-    ee.Initialize(project="ee-bqt2000204051")
+    # 显示结果
+    st.subheader('计算结果')
+    col1, col2, col3 = st.columns(3)
 
-    # # LLM setup
-    # model = ChatOpenAI(
-    #     model="gpt-4o-mini", temperature=0,
-    #     max_tokens=10000, timeout=30000,
-    #     verbose=True, api_key=os.getenv("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")
-    # )
-        # LLM setup
-    model = ChatOpenAI(
-        model="gemini-2.5-flash", temperature=0,
-        max_tokens=10000, timeout=30000,
-        verbose=True, api_key="AIzaSyCtre1849Lj1WvyCRY7p48cTLNWWM2v7ps"
-    )
-    assistant = VisualizationAssistant(model)
+    with col1:
+        st.metric(label="单株生物量", 
+                 value=f"{biomass_per_tree:.2f} Mg")
 
-    # render chat history
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
+    with col2:
+        st.metric(label="每公顷生物量", 
+                 value=f"{biomass_per_ha:.2f} Mg/ha")
 
-    # input
-    if prompt := st.chat_input("Ex: 'Tokyo, May to August 2023'"):
-        st.session_state.messages.append({"role":"user","content":prompt})
-        st.chat_message("user").write(prompt)
+    with col3:
+        st.metric(label="每公顷碳储量", 
+                 value=f"{carbon_per_ha:.2f} MgC/ha")
 
-        # extract and visualize
-        raw = assistant.extract_data(prompt)
-        with st.chat_message("assistant"):
-            st.write(f"🔍 Extracted result: `{raw}`")
-            spec = ast.literal_eval(raw) 
-            point = spec["point"]
-            point = list(point)
-            assistant.show(point, spec["START"], spec["END"])
+    # 添加说明
+    st.info("""
+    注意事项:
+    1. 本估算使用通用方程,可能需要根据具体树种和地区进行调整
+    2. 生物量转换为碳储量使用系数0.5
+    3. 结果单位: Mg = 兆克(吨), ha = 公顷
+    """)
 
-        st.session_state.messages.append({"role":"assistant","content":spec})
-
-if __name__ == "__main__":
-    if 'initialized' not in st.session_state:
-        set_llm_cache(InMemoryCache())
-        st.session_state.initialized = True
-    main()
+# 添加页脚
+st.markdown("---")
+st.markdown("""
+*参考文献:*
+- Chave et al. (2014) Improved allometric models to estimate the aboveground biomass of tropical trees
+- IPCC Guidelines for National Greenhouse Gas Inventories
+""")
